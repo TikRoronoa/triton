@@ -1,0 +1,52 @@
+第 1 天：端到端地图 + 插件边界
+上午（4h）：Python → JIT → 编译产物（PTX/SASS 概念）整条链画一张图；读 third_party/nvidia/triton_nvidia.cc 前 100～150 行，记下注册了哪些 dialect/pass。
+下午（4h）：在 python/ 里跟一条 triton.jit 的编译调用链到 C++；搞清 NVIDIA 是插件、和 lib/ 主仓的分工。
+产出：一页笔记：「入口函数 → PassManager 大致在哪 → 插件名」。
+
+第 2 天：Triton / TritonGPU IR 与 GEMM 对应
+上午：TritonGPU dialect 里与 layout、dot、memory 相关的 op/类型（不必全读，以 tutorial 为锚）。
+下午：对照 python/tutorials/03-matrix-multiplication.py，标注：block、tl.dot、K 循环 分别对应 IR 里哪类结构（概念级即可）。
+产出：tutorial 与 IR 概念的「对照表」。
+
+第 3 天：TritonNvidiaGPU + 插件内 dialect（NVGPU / NVWS）概览
+上午：lib/Dialect/TritonNvidiaGPU/：有哪些 Transforms、Passes.td 里 pass 列表扫一遍。
+下午：third_party/nvidia/lib/Dialect/NVGPU、NVWS：各解决什么问题（middle-end vs 更贴硬件）。
+产出：pass 清单 + 每条一句话「前/后 IR 层级」。
+
+第 4 天：Lit / triton-opt 实操
+上午：按 AGENTS.md 跑通 一个 与 TritonGPU/TritonNvidiaGPU 相关的 .mlir lit；学会看 IR diff。
+下午：自己改一个最小 .mlir 或复制 lit 片段，手动加/删 1～2 个 pass 观察变化。
+产出：一条可复现的命令 + 前后 IR 片段存档。
+
+第 5 天：TritonNVIDIAGPUToLLVM 总线与 Pattern 挂载
+全天：精读 third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp（或同名主文件）及 CMake 列出的核心 .cpp 分工；搞清 哪些 op 在哪个文件里 lower。
+产出：「文件 → 负责的 op 类别」索引表。
+
+第 6 天：Dot / MMA 路径（和你 GEMM 经验对齐）
+上午：DotOpToLLVM/ 目录结构：MMAv2、WGMMA、MMAv5 等各自对应什么代际/场景（以代码注释与分支为准）。
+下午：选定 3080（sm_86） 相关路径精读一条：从 dot pattern 到 PTX/内联 asm 的调用链走通一遍。
+产出：单条「dot lowering」调用栈（5～10 个函数名级别即可）。
+
+第 7 天：Load/Store 与 Layout 转换
+上午：LoadStoreOpToLLVM.cpp：global/shared、vectorization 等与性能相关的点。
+下午：ConvertLayoutOpToLLVM.cpp：layout 为何是 GEMM 性能关键。
+产出：3～5 条「性能问题先怀疑哪里」的检查项。
+
+第 8 天：PTX / TargetInfo / 单测
+上午：TargetInfo.cpp、PTXAsmFormat：字符串与约束怎么组织。
+下午：third_party/nvidia/unittest/ 里与 PTX/format 相关的测试读一遍。
+产出：理解「为什么要有 format 测试」+ 能改一行格式相关代码并跑 unittest（可选）。
+
+第 9 天：CUDA 侧 compile / runtime 最后一公里
+全天：third_party/nvidia/tools/cuda/、backend/（若需）：LLVM IR / PTX 如何交给工具链；和 NVVM 翻译的关系串起来。
+产出：补全第 1 天那张图里「MLIR 之后」的细节。
+
+第 10 天：综合与自设小目标
+上午：从 tutorial 03 选一个变体（例如改 BLOCK 或 num_stages），预测 IR/lowering 哪一层会受影响，再用 triton-opt 或打印验证（以你环境支持的方式为准）。
+下午：写 半页～一页 总结：pipeline、你最熟的 dot 路径、下一步想深入的专题（Hopper、tmem、autotune 等）。
+产出：可给别人讲的「10 分钟版」NVIDIA 后端串讲。
+
+总时长
+约 10 个工作日（80 小时） 可到「能独立追一条 dot 从 Python 到 PTX、知道该打开哪个 cpp」的程度；若中间加 2 天缓冲（排障、编译环境、跟丢链），按 2～2.5 周 更稳。
+
+若要压缩成 1 周高强度版：合并第 4+8 天（lit+unittest 半天）、第 9 天减半，但会降低对 runtime 的把握。
