@@ -8,6 +8,38 @@
 下午：对照 python/tutorials/03-matrix-multiplication.py，标注：block、tl.dot、K 循环 分别对应 IR 里哪类结构（概念级即可）。
 产出：tutorial 与 IR 概念的「对照表」。
 
+产出：
+
+环境结论
+
+make dev-install 成功
+triton-opt 可用
+lit 用例通过（例如 test/TritonNvidiaGPU/tmem_layouts.mlir）
+当前机器无 GPU，tutorial 03 运行时会报 0 active drivers（预期）
+对照1：BLOCK_SIZE_M/N/K -> IR 中 tile/layout 概念
+
+Python 侧：BLOCK_SIZE_M/N/K 决定每个 program 处理的子块大小
+IR 侧观察点：tensor<...x...> 形状、tt.make_range、tt.expand_dims、tt.broadcast、tt.addptr
+例子结论：IR 中通过 range + broadcast + addptr 构造了 block 级地址访问模式
+对照2：tl.dot(a, b, accumulator) -> IR 中 tt.dot
+
+Python 侧：accumulator = tl.dot(a, b, accumulator)
+IR 侧观察点：tt.dot（通常在循环体内）
+例子结论：tt.dot 是 GEMM 核心计算语义，对应 block 乘加
+对照3：for k in range(...) -> IR 中 scf.for
+
+Python 侧：沿 K 维迭代，逐块 load A/B，累加到 accumulator
+IR 侧观察点：scf.for ... iter_args(...) + 循环内 tt.load/tt.dot + 指针推进（tt.addptr）
+例子结论：K 方向分块迭代在 IR 中显式成为 loop + carried values
+本日可复现命令
+
+BUILD_DIR=$(PYTHONPATH="./python" python3 -c 'from build_helpers import get_cmake_dir; print(get_cmake_dir())')
+ninja -C "$BUILD_DIR" triton-opt
+lit -v "$BUILD_DIR"/test/TritonNvidiaGPU/tmem_layouts.mlir
+"$BUILD_DIR"/bin/triton-opt test/TritonGPU/matmul.mlir -convert-triton-to-tritongpu=target=cuda:80 -tritongpu-remove-layout-conversions -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-pipeline=num-stages=3 -canonicalize -o /tmp/matmul.after.mlir
+rg "scf.for|tt.dot|tt.load|tt.store|tt.addptr" /tmp/matmul.after.mlir
+
+
 第 3 天：TritonNvidiaGPU + 插件内 dialect（NVGPU / NVWS）概览
 上午：lib/Dialect/TritonNvidiaGPU/：有哪些 Transforms、Passes.td 里 pass 列表扫一遍。
 下午：third_party/nvidia/lib/Dialect/NVGPU、NVWS：各解决什么问题（middle-end vs 更贴硬件）。
@@ -50,3 +82,8 @@
 约 10 个工作日（80 小时） 可到「能独立追一条 dot 从 Python 到 PTX、知道该打开哪个 cpp」的程度；若中间加 2 天缓冲（排障、编译环境、跟丢链），按 2～2.5 周 更稳。
 
 若要压缩成 1 周高强度版：合并第 4+8 天（lit+unittest 半天）、第 9 天减半，但会降低对 runtime 的把握。
+
+
+
+
+

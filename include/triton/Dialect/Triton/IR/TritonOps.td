@@ -207,6 +207,7 @@ def TT_AddPtrOp : TT_Op<"addptr",
     let hasFolder = 1;
 }
 
+// 搞懂load/store这两个operation
 //
 // Load/Store Ops
 //
@@ -624,6 +625,7 @@ def TT_GetNumProgramsOp : TT_Op<"get_num_programs", [Pure]> {
     }];
 }
 
+// 搞懂dot这个operation
 //
 // Dot Op
 //
