@@ -377,6 +377,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_allocate_warp_groups(pm)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
+        # 把createAllocateSharedMemoryNvPass 这个pass放到当前PassManager 的 pass 管道里，还没执行
         nvidia.passes.ttgpuir.add_allocate_shared_memory_nv(pm, capability, ptx_version)
         nvidia.passes.ttnvgpuir.add_allocate_tensor_memory(pm)
         nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
@@ -384,6 +385,7 @@ class CUDABackend(BaseBackend):
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
+        # createConvertTritonGPUToLLVMPass 这个pass放到当前PassManager 的 pass 管道里，还没执行
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version, "consan" in options.instrumentation_mode)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
@@ -399,7 +401,7 @@ class CUDABackend(BaseBackend):
 
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
-
+        # 执行所有pass，包括createAllocateSharedMemoryNvPass 和 createConvertTritonGPUToLLVMPass，生成llvm.operation式的文本
         pm.run(mod, 'make_llir')
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
@@ -426,6 +428,7 @@ class CUDABackend(BaseBackend):
         if knobs.compilation.enable_asan:
             raise RuntimeError(
                 "Address Sanitizer Error: Address sanitizer is currently only supported on the AMD backend")
+        # 生成llvm.module式的文本
         llvm_mod = llvm.to_module(mod, context)
         proc = sm_arch_from_capability(capability)
         features = get_features(options, self.target.arch)
@@ -457,6 +460,8 @@ class CUDABackend(BaseBackend):
         del context
         return ret
 
+    # 生成ptx.module式的文本
+    # 把上游传来的 LLVM IR 字符串（来自 make_llir 里 str(llvm_mod) 那一段，458 行返回的 ret）交给 LLVM 的 NVPTX 目标，汇编成 PTX 字符串 ret。后面再用正则改 .version / .target sm_* 等
     def make_ptx(self, src, metadata, opt, capability):
         ptx_version = get_ptx_version_from_options(opt, self.target.arch)
 
@@ -464,6 +469,7 @@ class CUDABackend(BaseBackend):
         proc = sm_arch_from_capability(capability)
         features = get_features(opt, self.target.arch)
         flags = ["nvptx-mad-wide-opt"]
+        # 生成ptx.module式的文本
         ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False)
         # Find kernel names (there should only be one)
         names = re.findall(r".visible .entry ([a-zA-Z_][a-zA-Z0-9_]*)", ret)
@@ -483,6 +489,7 @@ class CUDABackend(BaseBackend):
             print(ret)
         return ret
 
+    # 把上游传来的 PTX 字符串（来自 make_ptx 里 return ret 那一段，501 行返回的 ret）交给 ptxas 汇编成 cubin 字节码
     def make_cubin(self, src, metadata, opt, capability):
         ptxas = get_ptxas(self.target.arch).path
         with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \
@@ -565,7 +572,7 @@ please share the reproducer above with Triton project.
             if os.path.exists(fbin):
                 os.remove(fbin)
         return cubin
-
+    # 添加 stages 阶段，每个阶段都对应一个函数，每个函数都接收上游传来的 src 和 metadata 作为参数，并返回一个字符串
     def add_stages(self, stages, options, language):
         capability = self._parse_arch(options.arch)
         if language == Language.TRITON:

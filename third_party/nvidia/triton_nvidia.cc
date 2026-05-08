@@ -125,6 +125,9 @@ public:
   void synchronize() { check(cuCtxSynchronize(), "cuCtxSynchronize"); }
 };
 
+// 向python注册两个pass：
+// createAllocateSharedMemoryNvPass 
+// createConvertTritonGPUToLLVMPass
 void init_triton_nvidia_passes_ttgpuir(py::module &&m) {
   using namespace mlir::triton;
   // TODO: it is weird to pass mlir::triton::NVVM here since the conversion is
