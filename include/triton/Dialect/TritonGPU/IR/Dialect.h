@@ -204,15 +204,16 @@ inline SmallVector<unsigned> getOrder(TensorOrMemDesc type) {
 SmallVector<unsigned> getOrderForMemory(DistributedEncodingTrait layout,
                                         ArrayRef<int64_t> shape);
 inline SmallVector<unsigned> getOrderForMemory(RankedTensorType type) {
-  return getOrderForMemory(cast<DistributedEncodingTrait>(type.getEncoding()),
-                           type.getShape());
+  return getOrderForMemory(cast<DistributedEncodingTrait>(type.getEncoding()),// #blocked（再 cast 成 DistributedEncodingTrait
+                           type.getShape());// [128, 32]
 }
 inline SmallVector<unsigned> getOrderForMemory(TensorOrMemDesc type) {
-  if (auto memDesc = dyn_cast<MemDescType>(type)) {
+  // type: load阶段是tensor<128x32xf16, #blocked>
+  if (auto memDesc = dyn_cast<MemDescType>(type)) {// 已是 shared/memdesc → 直接取 order
     return getOrder(memDesc);
-  } else {
+  } else {// 普通 tensor → 从 distributed encoding 推 memory order
     auto tensorTy = cast<RankedTensorType>(type);
-    return getOrderForMemory(tensorTy);
+    return getOrderForMemory(tensorTy);// 对 GEMM 的 #blocked，通常最终得到 [1, 0]
   }
 }
 

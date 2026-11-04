@@ -295,15 +295,18 @@ int mlir::triton::getCopyVecBytes(RankedTensorType registerTy,
 bool mlir::triton::canBeConvertedToAsyncLoad(
     tt::LoadOp loadOp, tt::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
   auto ptr = loadOp.getPtr();
+  // 这次 load 最多能连续读多少个元素（向量宽度的“个数”）。用来判断cp.async 够不够宽，对于lp2的layout，这里返回4
+  // 最快维上的连续元素个数：#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+  // 最快维是dim1，所以对应sizePerThread[1] = 4，这就是getContiguity这个函数的功能
   unsigned vec = axisInfoAnalysis.getContiguity(ptr);
   if (auto mask = loadOp.getMask())
     vec = std::min<unsigned>(vec, axisInfoAnalysis.getMaskAlignment(mask));
 
-  auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+  auto tensorTy = dyn_cast<RankedTensorType>(ptr.getType());//tensor<128x32x!tt.ptr<f16>, #blocked>
   unsigned width = 0;
   if (tensorTy) {
-    auto ty = cast<tt::PointerType>(tensorTy.getElementType()).getPointeeType();
-    width = vec * ty.getIntOrFloatBitWidth();
+    auto ty = cast<tt::PointerType>(tensorTy.getElementType()).getPointeeType();//f16
+    width = vec * ty.getIntOrFloatBitWidth();//4 * 16 = 64
   } else {
     width = cast<tt::PointerType>(ptr.getType())
                 .getPointeeType()
@@ -484,10 +487,11 @@ ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(RankedTensorType ty) {
   return ttg::SwizzledSharedEncodingAttr::get(ty.getContext(), 1, 1, 1, order,
                                               cgaLayout);
 }
-
+//  为load 选一个 shared memory 的 layout（encoding），按优先级试四档，选中就返回。不改 IR。
 ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(Operation *op) {
   // Try to use local alloc encoding if possible.
   ttg::SharedEncodingTrait localAllocEnc;
+  // 此时load op的使用者不是LocalAllocOp，所以直接跳过if
   if (llvm::any_of(op->getUsers(), [&](Operation *user) {
         return isa<ttg::LocalAllocOp>(user);
       })) {
@@ -510,10 +514,11 @@ ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(Operation *op) {
       }
     }
   }
-
-  auto ty = cast<RankedTensorType>(op->getResultTypes()[0]);
-  auto cgaLayout = ttg::getCGALayout(ty.getEncoding());
-  auto order = ttg::getOrder(ty);
+  // #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+  auto ty = cast<RankedTensorType>(op->getResultTypes()[0]);//tensor<128x32xf16, #blocked>（RankedTensorType）
+  auto cgaLayout = ttg::getCGALayout(ty.getEncoding());//从 #blocked 取出的 CGA encoding，对于ampere来说，这里恒为1D layout
+  auto order = ttg::getOrder(ty);//[1, 0]
+  // TMA 类 load
   if (auto load = dyn_cast<tt::DescriptorLoadLikeOpInterface>(op)) {
     // TMA encoding is set on the descriptor type
     return ttng::getEncodingFromDescriptor(op, ty, load.getDesc());
@@ -744,14 +749,15 @@ triton::getTopLevelUsersInLoop(Operation *op, scf::ForOp forOp,
 
 // Helper function that finds an operation based on a comparison predicate
 static Operation *getUseOfPipelinedOp(
-    ArrayRef<Operation *> ops, scf::ForOp forOp,
-    triton::CoarseSchedule &schedule,
-    std::function<bool(Operation *)> filterUse,
-    std::function<bool(Operation *, Operation *)> shouldPrefer) {
+    ArrayRef<Operation *> ops, // 被 pipeline 的 op（createAsyncCopy 里就是 {loadOp}）
+    scf::ForOp forOp,//所在循环
+    triton::CoarseSchedule &schedule,//schedule[loadOp] 是 load 的 stage 和 cluster
+    std::function<bool(Operation *)> filterUse,//可选过滤某些 user（常为 null）
+    std::function<bool(Operation *, Operation *)> shouldPrefer) {//shouldPrefer(a, b)，a 是否优于当前选中的 b
   DenseSet<Operation *> topLevelUsers;
   Operation *selectedUser = nullptr;
   for (Operation *op : ops) {
-    auto users = triton::getTopLevelUsersInLoop(op, forOp, filterUse);
+    auto users = triton::getTopLevelUsersInLoop(op, forOp, filterUse);//取所有顶层user
     topLevelUsers.insert(users.begin(), users.end());
   }
   for (Operation *topLevelUser : topLevelUsers) {

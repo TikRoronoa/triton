@@ -63,10 +63,19 @@ public:
       : forOp(forOp), numStages(numStages), opLatency(opLatency) {};
 
   void run() {
+    // kNumStagesAttrName：tt.num_stages
     bool pipelineWithoutDot = forOp->hasAttr(mlir::triton::kNumStagesAttrName);
+    // 从当前 scf.for 往上找到最外层的 module（整颗 IR 的根）。
     ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
+    // 对这个 module 做 AxisInfo（轴信息）分析：指针/mask 的 contiguity、对齐等。
     tt::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
+    /*
+    loadOpToIndLevel = {
+      (A 的 tt.load,  {0, 那个 tt.dot}),
+      (B 的 tt.load,  {0, 同一个 tt.dot}),
+    }
+    */
     llvm::MapVector<Operation *, std::pair<int, Operation *>> loadOpToIndLevel =
         loadOpsToIndirectionLevel(forOp, pipelineWithoutDot, axisInfoAnalysis,
                                   numStages);
@@ -251,6 +260,9 @@ private:
 // final dot op.
 void assignLatencies(ModuleOp moduleOp, int defaultNumStages) {
   SmallVector<scf::ForOp> loops;
+  // 从该 Module 往下走遍所有嵌套的 Operation
+  // 不是给 module「注册」一个长期持有的 lambda，
+  // 而是 walk 时临时用这个 lambda 当 visitor，边走边筛出要 pipeline 的 scf.for。
   moduleOp->walk([&](scf::ForOp forOp) {
     // Bail out for loops with num_stage <= 1.
     if (preCondition(forOp) &&
@@ -329,6 +341,11 @@ loadOpsToIndirectionLevel(scf::ForOp forOp, bool pipelineWithoutDot,
         }
       };
 
+  /*
+  dfs(dot)
+  → 沿 A: convert → loadA   ⇒  (loadA, {0, dot})
+  → 沿 B: convert → loadB   ⇒  (loadB, {0, dot})
+  */
   for (Operation &op : forOp.getBody()->without_terminator()) {
     // Arbitrary heuristic. TMEMStoreOp is included to keep logic consistent
     // with legacy code when we weren't hoisting tmem allocas.

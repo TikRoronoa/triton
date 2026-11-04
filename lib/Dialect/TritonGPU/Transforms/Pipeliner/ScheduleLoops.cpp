@@ -32,59 +32,120 @@ template <typename... OpTypes> static bool containsAny(scf::ForOp forOp) {
   return result.wasInterrupted();
 }
 
-// Return true if the preconditions for pipelining the loop are met.
+// 判断该 for 是否满足软件流水的前置条件。
 bool isSafeToPipeline(scf::ForOp forOp) {
-  // Skip loop with distance > 1.
+  // 跳过 loop-carried 依赖距离 > 1 的循环（expander 暂不支持）。
   if (loopHasDistGreaterThanOne(forOp))
     return false;
-  // Don't pipeline outer loops.
+  // 不 pipeline 外层循环（体内还嵌套 for/while）。
   if (isOuterLoop(forOp))
     return false;
-  // Skip loops with barriers, asserts or prints
+  // 含 barrier / assert / print 的循环跳过。
   if (containsAny<ttg::BarrierOp, tt::AssertOp, tt::PrintOp>(forOp))
     return false;
 
   return true;
 }
 
-// Find dependencies with distance of 1. They will go to the next stage,
-// but in the cluster before the current op.
+// 处理跨迭代 distance=1 的依赖：
+/**
+第 i 轮:   addptr → yield %17
+                ↓
+第 i+1 轮: load 用 %arg6（就是上一轮的 %17）
+*/
 void scheduleDistanceOneDependencies(scf::ForOp forOp,
                                      CoarseSchedule &schedule) {
-  int numStages = schedule.getNumStages();
+  int numStages = schedule.getNumStages();// 3
 
-  // Mapping from the cluster to the cluster before it.
+  // cluster -> 该 cluster 之前新建的 dist1 cluster（按需创建）。
   DenseMap<CoarseSchedule::ClusterHash, CoarseSchedule::Cluster> dist1Cluster;
+  /*
+  op: loadA/B, convert_layout, dot, addptr, scf.yield
+  */
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (schedule.count(&op) == 0)
+    if (schedule.count(&op) == 0)//刚进这个函数时，addptr 一般还不在 schedule 里。所以扫到addptr是continue
       continue;
+    //扫到已在 schedule 里的 load → 发现操作数是 iter_arg → 从 yield 反查到定义是 addptr → 再 insertIfAbsent(addptr, stage+1, ...)。
     auto [stage, cluster] = schedule[&op];
-    // Can't schedule past the last stage.
+    // 已在最后一 stage，不能再往后排。
     if (stage == numStages - 1)
       continue;
-    for (Value operand : getNestedOperands(&op)) {
+    //getNestedOperands(&op) 获取当前 op 的所有操作数
+    for (Value operand : getNestedOperands(&op)) {//当前已排 op 的所有操作数
+      // 操作数是本 block 的 iter_arg（跨迭代依赖）。
       if (auto arg = dyn_cast<BlockArgument>(operand)) {
+        //操作数是不是 block 参数？%arg6 是 → 进去。普通 %11 那种不是 → 跳过。
         if (arg.getArgNumber() > 0 && arg.getOwner() == op.getBlock()) {
-          auto yieldOp = op.getBlock()->getTerminator();
+          auto yieldOp = op.getBlock()->getTerminator();//拿到 scf.yield。
+          // 这行是在做 iter_arg ↔ yield 操作数 的下标对齐。
+          /**
+          argNumber 0:  归纳变量 %iv
+          argNumber 1:  第 1 个 iter_arg   ← 例如 %arg6 指针
+          argNumber 2:  第 2 个 iter_arg   ← %arg7
+          argNumber 3:  第 3 个 iter_arg   ← %arg8
+          而 scf.yield 的操作数没有 iv，只有要传给下一轮的 carried values：
+          yield operand 0 → 下一轮 arg1
+          yield operand 1 → 下一轮 arg2
+          yield operand 2 → 下一轮 arg3
+          所以差 1：
+          yield 下标 = arg.getArgNumber() - 1
+          */
+
+          /*
+          scf.for %iv = %lb to %ub step %step  iter_args(%arg6, %arg7, %arg8)
+            %11 = tt.load %arg6 ...          // 当前已排 op，stage=0
+            ...
+            %17 = tt.addptr %arg6, ...       // 还没排
+            scf.yield %17, %18, %16
+
+            %iv 每轮由 for 自己按 step 更新，不经过 yield
+            yield 有几个操作数，就对应几个 iter_args
+            所以 body 参数是 [iv] + iter_args，而 yield 操作数只有 iter_args，下标才要 - 1
+          */
+          // yieldOp的参数是3个，arg.getArgNumber()是四个
+          //这里每次取出一个operand，上面的%6, %7, %8分三次取出
           Value v = yieldOp->getOperand(arg.getArgNumber() - 1);
-          Operation *defOp = v.getDefiningOp();
-          if (defOp && schedule.count(defOp) == 0) {
-            if (isa<tt::LoadOp>(defOp)) {
-              // Exception: Schedule loads with a distance of 1 together
-              // with the current op.
+          /**
+          本轮:  %17 = addptr ...
+                scf.yield %17, ...     ← v 是 %17，defOp 是 addptr
+
+          下一轮: %arg6 用的就是这个 %17
+          */
+          Operation *defOp = v.getDefiningOp();// 找到%17 = addptr ...这个ssa
+          if (defOp && schedule.count(defOp) == 0) {//还没有schedule
+            if (isa<tt::LoadOp>(defOp)) {// 例外：distance=1 的 load 与当前 op 同排。
               schedule.insertIfAbsent(defOp, stage, cluster);
               schedule.insertDepsOfOp(defOp, stage, cluster,
                                       /*includeArg=*/true,
                                       /*insertIfEarlier=*/true);
-            } else {
+            } else {// 普通情况：定义排到下一 stage，cluster 在当前之前。
+              // 把当前 op（load）的 cluster 收成一个 hash，当缓存 key。
+              /**
+              对 GEMM、当前 op 是某个 tt.load（stage=0，cluster 指向 id 为 2 的那个桶）时：
+              cluster是load 已有的那个 cluster 迭代器（桶里存的编号一般是 2）。
+              不是 2 这个业务编号，而是：reinterpret_cast<size_t>(&*cluster)
+              即 list 里那个 int 节点的地址，当成 DenseMap 的 key（一个不透明的整数，如 0x7ffe...）。
+              用来区分“是不是同一个 cluster 对象”，不依赖编号之后被 newBefore 改掉。
+              */
               CoarseSchedule::ClusterHash clusterHash =
                   CoarseSchedule::hashCluster(cluster);
-              if (dist1Cluster.count(clusterHash) == 0) {
+              //给当前 load 的 cluster 按需建一个“前面的” dist1 桶，并缓存起来。
+              /*
+              第一次（比如 load A）：map 里没有 → newBefore，得到新 cluster，写进 dist1Cluster
+              第二次（load B 同一 cluster）：已有 → 不再建，后面直接用 dist1Cluster[clusterHash] 给 addptr 用
+              */
+              if (dist1Cluster.count(clusterHash) == 0) {//还没为这个 cluster 建过
                 dist1Cluster[clusterHash] =
-                    schedule.clusters.newBefore(cluster);
+                    schedule.clusters.newBefore(cluster);//在 load 的 cluster 前面新建一个
               }
+              // 把 addptr（defOp）正式写进 schedule
+              // defOp ： tt.addptr
+              // stage + 1： load 是 0 → addptr 是 1
+              // insertIfAbsent：若这个 op 还没有 schedule 记录，就插入；
+              // 已经有了就不动（避免两个 load 各插一次把同一个 addptr 改乱）。
               schedule.insertIfAbsent(defOp, stage + 1,
                                       dist1Cluster[clusterHash]);
+              // 看addptr的操作数，GEMM会直接跳过，do nothing
               schedule.insertDepsOfOp(defOp, stage + 1,
                                       dist1Cluster[clusterHash],
                                       /*includeArg=*/true,
@@ -97,12 +158,12 @@ void scheduleDistanceOneDependencies(scf::ForOp forOp,
   }
 }
 
+// 把仍未入 schedule 的 op 全部放到最后一 stage。
+// 同时保证：use 的 cluster 不能早于其 def（必要时把 user 往后推）。
 void scheduleRemainingToLastStage(scf::ForOp forOp, CoarseSchedule &schedule,
                                   CoarseSchedule::Cluster afterPrologue) {
   int numStages = schedule.getNumStages();
-  // Assign the rest of the ops to the last stage.
-  // Take care of the ordering of the ops - uses cannot be scheduled to the
-  // cluster before the definition.
+  // 未排 op 先默认放到 afterPrologue 这个 cluster。
   DenseMap<Operation *, CoarseSchedule::Cluster> opToCluster;
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (schedule.count(&op) == 0) {
@@ -111,12 +172,12 @@ void scheduleRemainingToLastStage(scf::ForOp forOp, CoarseSchedule &schedule,
   }
   SmallVector<Operation *> queue;
   for (auto [op, stage, cluster] : schedule.getOpsInOrder(forOp)) {
-    // We really only care about the producers from the last stage.
-    // Others will be scheduled before these ops anyway.
+    // 只从最后一 stage 的生产者出发传播 cluster 约束。
     if (stage == numStages - 1) {
       queue.push_back(op);
     }
   }
+  // 若 user 的 cluster 早于 def，则把 user 推到与 def 同 cluster。
   while (!queue.empty()) {
     Operation *op = queue.pop_back_val();
     for (auto user : op->getUsers()) {
@@ -140,102 +201,118 @@ void scheduleRemainingToLastStage(scf::ForOp forOp, CoarseSchedule &schedule,
 }
 
 namespace {
+// 循环体内是否已有任意 op 带 latency（在 opLatency map 里）。
 bool hasLatenciesAssigned(scf::ForOp forOp,
                           const DenseMap<Operation *, int> &opLatency) {
+  // 循环体里 load、dot、addptr 那些，不包括结尾的 scf.yield
+  /*
+  scf.for                    ← 这是一个 Operation
+  └── Region（循环体）
+        └── Block
+              ├── tt.load      ← 里面的 Operation
+              ├── tt.dot
+              ├── tt.addptr
+              └── scf.yield    ← terminator
+  */
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (opLatency.count(&op))
+    if (opLatency.count(&op))// 这里是在找这个forop中是否至少有一个op出现在map中
       return true;
   }
   return false;
 }
 
+// 根据 latency 给“关键路径”上的 op 分配初始 stage/cluster。
+// 核心：从 latency op 出发算到 yield 的最长路径距离，再反推 stage。
 CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
                               const DenseMap<Operation *, int> &opLatency) {
-  llvm::MapVector<Operation *, int> opToStage;
-  // Find terminator for later reference
+  llvm::MapVector<Operation *, int> opToStage;// 用于生成各个op的stage
   auto terminator = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-  // Determine all operations that have a non-zero latency
+  // 收集当前forOp所有带 latency 的 op（通常是可异步的 load 等）。opLatency是整个module的map
   SmallVector<Operation *> latOps;
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (opLatency.count(&op))
       latOps.push_back(&op);
   }
-  // If no latency ops, nothing to schedule
   if (latOps.empty())
     return CoarseSchedule(0);
 
-  DominanceInfo domInfo(forOp);
-  // Compute the longest path to the yield for each operation reachable
-  // from any latency operation.
+  DominanceInfo domInfo(forOp);//可删除，没用上
+
+  // distance[op] = 自身 latency + 下游 user 的最大 distance（到 yield 的最长路）。
   DenseMap<Operation *, int> distance;
+  // 沿着 use 链朝 yield 方向，找加权最长路；yield 本身不参与，只是路径尽头。
   std::function<int(Operation *)> computeDistance = [&](Operation *op) -> int {
     auto it = distance.find(op);
     if (it != distance.end())
       return it->second;
-    // Compute max distance among all users that are inside the loop body
     int maxDist = -1;
     for (Operation *user : op->getUsers()) {
-      // Only consider users inside the same block and not the terminator
+      //第一轮：user是convert_layout,在forOp中，所以直接返回convert_layout本身
+      //第二轮：user是dot,在forOp中，所以直接返回dot本身
+      //第三轮：user是scf.yield,在forOp中，所以直接返回scf.yield本身
       Operation *inBlockUser = forOp.getBody()->findAncestorOpInBlock(*user);
       if (!inBlockUser || inBlockUser == terminator)
         continue;
       int distUser = computeDistance(inBlockUser);
       if (distUser > maxDist)
+        /*
+        distUser = computeDistance(dot) = 0, maxDist = 0;
+        distUser = computeDistance(convert_layout) = 0, maxDist = 0;
+        distUser = computeDistance(loadA/B) = 2, maxDist = 0;
+        */
         maxDist = distUser;
     }
     int lat = 0;
     if (opLatency.count(op))
       lat = opLatency.lookup(op);
-    // If an op has no users (maxDist == -1) but has latency, we include its
-    // latency otherwise it contributes 0 to the distance.
+    // 无 user 时：若自身有 latency 仍计入，否则贡献 0。
     int d = lat + (maxDist < 0 ? 0 : maxDist);
+    /* 
+    distance[dot] = 0;
+    distance[convert_layout] = 0;
+    distance[loadA/B] = 2;
+    */
     distance[op] = d;
     return d;
   };
 
-  // Compute distances for all latency-starting ops
+  // 从所有 latency op 出发，取全局最大距离。
   int maxDistance = 0;
   for (Operation *latOp : latOps) {
+    // 只有带latency的load才走computeDistance，addptr不走这里
     int d = computeDistance(latOp);
     if (d > maxDistance)
       maxDistance = d;
   }
 
-  // Assign stage to each op reachable from a latency op
+  // stage = maxDistance - dist：距离 yield 越远（越大 dist）→ 越早的 stage。
+  // 例：load latency=2、dot distance=0 → load 在 stage 0，dot 在 stage 2。
   for (auto [op, dist] : distance) {
-    // We only schedule ops that are downstream of a latency op
-    // (had a non-negative distance due to a latency op).
     if (dist >= 0)
       opToStage[op] = maxDistance - dist;
   }
 
-  auto stages = llvm::make_second_range(opToStage);
-  int maxStage = *llvm::max_element(stages);
+  // 接下来把stage变成cluster
+  auto stages = llvm::make_second_range(opToStage); // 取出opToStage的second，即stage
+  int maxStage = *llvm::max_element(stages); // 取出stages中的最大值，为2
   CoarseSchedule schedule(maxStage + 1);
-  SmallVector<CoarseSchedule::Cluster> clusters(maxStage + 1);
-  for (int i = 0; i <= maxStage; i++) {
+  SmallVector<CoarseSchedule::Cluster> clusters(maxStage + 1); // 创建maxStage + 1个cluster
+  for (int i = 0; i <= maxStage; i++) {//
     clusters[i] = schedule.clusters.newAtBack();
   }
-  // Assign ops to the clusters in reverse-stage order;
-  // ops with higher stage numbers are assigned first. This way we will
-  // end up with roughly reverse program order in the clusters.
+  // 按 stage 从高到低插入，使 cluster 内大致呈反向程序序。
   for (auto [op, stage] : opToStage)
     schedule.insert(op, stage, clusters[maxStage - stage]);
 
-  // Move `scf.if` ops in the current schedule (forward slice of the latency
-  // ops) into a new epilogue cluster at the end of the schedule, pushing them
-  // as close to the end of the loop body as possible.
+  // 把已排路径上的 scf.if（且自身不是 latency op）尽量推到 epilogue cluster。
   CoarseSchedule::Cluster epilogue = schedule.clusters.newAtBack();
   for (auto [op, stage] : opToStage) {
     auto ifOp = dyn_cast<scf::IfOp>(op);
     if (!ifOp)
       continue;
-    // If the `scf.if` op itself is a latency op, skip it.
     if (opLatency.contains(ifOp))
       continue;
-    // Ensure this does not create scheduling conflicts by ensuring the forward
-    // slice of the `scf.if` does not contain ops that are already scheduled, as
-    // this will cause the `scf.if` to be scheduled after its dependents.
+    // 若 if 的 forward slice 里已有已排 op，再推后会造成依赖冲突，跳过。
     SetVector<Operation *> slice;
     getForwardSlice(ifOp, &slice);
     if (llvm::any_of(slice, [&](Operation *op) { return opToStage.count(op); }))
@@ -246,25 +323,23 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
   return schedule;
 }
 
-// Get an initial schedule for the loop. This is the base schedule from which
-// the rest of the pass will backward propagate dependencies.
+// 为单个 for 生成初始 schedule，后续步骤在此基础上补依赖。
 CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                                   const DenseMap<Operation *, int> &opLatency) {
+  // 不满足安全条件 → 空 schedule（调用方会直接 return）。
   if (!isSafeToPipeline(forOp))
     return CoarseSchedule(0);
 
-  // If the loop has assigned latencies, use them to determine the initial
-  // schedule.
+  // 常见路径：已有 assign-latencies 结果 → 按 latency 排关键 op。
   if (hasLatenciesAssigned(forOp, opLatency))
+    // 这里直排关键op的stage和cluster，即按照DFS load -> convert_layout -> dot ，不包括addptr
     return scheduleKeyOps(forOp, opLatency);
 
-  // If the loop has an existing schedule, use it as the base schedule.
+  // Warp-specialize 路径：循环上已有 stage/cluster，反序列化后复用/裁剪。
   CoarseSchedule schedule;
   if (forOp->hasAttr(kWarpSpecializeAttrName) &&
       succeeded(schedule.deSerialize(forOp))) {
-    // The loop was partitioned from a warp-specialized loop, meaning it can
-    // have a partial view of the original loop stages. Re-schedule the loop
-    // root at the stages of the latency ops to prune unnecessary stages.
+    // 该 for 来自 warp-specialize 分区，可能只看到原循环部分 stage。
     auto isLatencyOp = [&](Operation &op) {
       return opLatency.count(&op) ||
              isa<LoadOp, DescriptorLoadLikeOpInterface, LocalStoreOp,
@@ -274,9 +349,7 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
                  ttng::ArriveBarrierOp>(op);
     };
 
-    // If there are no latency ops or all latency ops are in the same stage, we
-    // don't need to pipeline the loop. Return a new schedule with everything
-    // assigned to the same stage.
+    // latency 相关 op 都在同一 stage（或没有）→ 不需要多 stage，压成 1 stage。
     DenseSet<int> latencyStages;
     auto ops = forOp.getBody()->without_terminator();
     for (Operation &op : llvm::make_filter_range(ops, isLatencyOp)) {
@@ -292,25 +365,24 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
       return normalized;
     }
 
+    // 多 stage：裁掉用不到的 stage 后返回。
     schedule.shrinkToFit();
     return schedule;
   }
 
+  // 既无 latency 也无已有 schedule → 空。
   return CoarseSchedule(0);
 }
 
-// Schedule the prologue and epilogue `if` ops in the loop, pushing them as
-// close to the loop boundaries as possible. Return the cluster after the
-// prologue (or the beginning of the loop if there is no prologue).
+// 把循环内 scf.if 尽量推到边界：相关 if → prologue，其余 → epilogue。
+// 返回 prologue 之后的 cluster（无 prologue 则为 clusters.begin()）。
 CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
                                                     CoarseSchedule &schedule) {
   int numStages = schedule.getNumStages();
   CoarseSchedule::Cluster afterPrologue = schedule.clusters.begin();
 
-  // Look for the IfOp that is in the backward slice any of the currently
-  // scheduled ops and put it at the beginning of the loop.
+  // 找落在“已排 op 反切片”上的 if，记为 prologue 候选。
   DenseMap<scf::IfOp, int> ifsToStage;
-  // Go stage by stage.
   for (int stage = 0; stage < numStages; stage++) {
     for (auto [op, stage_, cluster] : schedule.getOpsInOrder(forOp)) {
       if (stage_ != stage)
@@ -328,6 +400,7 @@ CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
       }
     }
   }
+  // prologue：新建最前 cluster，放入相关 if。
   if (!ifsToStage.empty()) {
     CoarseSchedule::Cluster prologueCluster = schedule.clusters.newAtFront();
     for (auto [ifOp, stage] : ifsToStage) {
@@ -335,7 +408,7 @@ CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
     }
   }
 
-  // Other IfOps should be pushed to the end.
+  // 其余 if 推到最后一 stage 的 epilogue cluster。
   CoarseSchedule::Cluster epilogueCluster = schedule.clusters.newAtBack();
   for (auto &op : forOp.getBody()->without_terminator()) {
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -350,7 +423,9 @@ CoarseSchedule::Cluster schedulePrologueAndEpilogue(scf::ForOp forOp,
 
 void scheduleLoop(scf::ForOp forOp,
                   const DenseMap<Operation *, int> &opLatency) {
-  // Based on the latencies, schedule the key ops to the stages.
+  // 1) 根据 latency（或已有 schedule）生成初始粗粒度 schedule：
+  //    给关键 op（如带 tt.latency 的 load）分配 stage/cluster。
+  //    不安全或没有可排内容时返回空 schedule。
   CoarseSchedule schedule = getInitialSchedule(forOp, opLatency);
   if (schedule.empty())
     return;
@@ -358,41 +433,62 @@ void scheduleLoop(scf::ForOp forOp,
     schedule.serialize(forOp);
     DBGS() << "Initial coarse schedule:\n" << forOp << "\n";
   });
-  // Schedule the dependencies
+
+  // 2) GEMM会跳过这里
+  // 处理循环里的 scf.if：
+  //    - 落在已排 op 反切片上的 if → 尽量推到循环开头（prologue）
+  //    - 其余 if → 推到循环末尾（epilogue）
+  //    返回值 afterPrologue：prologue 之后的 cluster，后面给“剩余 op”用。
   CoarseSchedule::Cluster afterPrologue =
       schedulePrologueAndEpilogue(forOp, schedule);
   LLVM_DEBUG({
     schedule.serialize(forOp);
     DBGS() << "Coarse schedule with prologue and epilogue:\n" << forOp << "\n";
   });
+
+  // 3) GEMM 会跳过这里
+  // 把已排 op 的依赖（定义链上的未排 op）拉进同一 stage/cluster，例如arith.cmpi计算k<K时
   scheduleDependencies(forOp, schedule);
   LLVM_DEBUG({
     schedule.serialize(forOp);
     DBGS() << "Coarse schedule with dependencies:\n" << forOp << "\n";
   });
+
+  // 4) 处理跨迭代 distance=1 的依赖：
+  //    本轮用到的是上一轮 yield 过来的值，定义要排到下一 stage
+  //    （load 的 distance=1 例外，可与当前 op 同 stage）。
+  // GEMM在这里处理addptr这个op
   scheduleDistanceOneDependencies(forOp, schedule);
   LLVM_DEBUG({
     schedule.serialize(forOp);
     DBGS() << "Coarse schedule with dist 1:\n" << forOp << "\n";
   });
+
+  // 5) GEMM 会跳过这里
+  // 仍未入 schedule 的 op，放到最后一 stage（cluster 不低于 afterPrologue）。
   scheduleRemainingToLastStage(forOp, schedule, afterPrologue);
   LLVM_DEBUG({
     schedule.serialize(forOp);
     DBGS() << "Final coarse schedule:\n" << forOp << "\n";
   });
 
-  // Write the schedule to the IR
+  // 6) 写回 IR：各 op 的 loop.stage / loop.cluster，
+  //    以及 for 上的 tt.scheduled_max_stage。
   schedule.serialize(forOp);
 }
 
 /// Schedule the loops based on the latencies assigned to the operations.
 void scheduleLoops(ModuleOp moduleOp) {
+  // 首先把latency attr提取出来，然后删掉IR中的latency attr
   DenseMap<Operation *, int> opLatency = deserializeLatencies(moduleOp);
   SmallVector<scf::ForOp> loops;
+  // 从整个 module 里把所有 scf.for 收集进 loops
+  // 深度优先遍历 module 下所有 Operation, 回调参数写成 scf::ForOp：只在遇到 for 时触发
   moduleOp->walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
   if (loops.empty())
     return;
   for (auto forOp : loops) {
+    // schedule每一个scf::ForOp
     scheduleLoop(forOp, opLatency);
   }
 }

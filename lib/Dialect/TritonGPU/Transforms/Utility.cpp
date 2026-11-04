@@ -1145,13 +1145,17 @@ swizzleDotOperandLike(RankedTensorType type, ttg::CGAEncodingAttr cgaLayout) {
 // used to be compatible with users' layouts. If there are incompatible shared
 // encodings, set incompatible to true.
 std::optional<ttg::SwizzledSharedEncodingAttr>
-getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible) {
+getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible) {// val指的是load的结果
   ttg::SwizzledSharedEncodingAttr attr;
   incompatible = false;
-  for (Operation *user : val.getUsers()) {
+  for (Operation *user : val.getUsers()) {// load的user只有convert_layout
+    //user 是 load 的使用者，这里是：
+    //%12 = ttg.convert_layout %11 : ... -> tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
     ttg::SwizzledSharedEncodingAttr tempAttr;
+    // user 必须恰好 1 个 result, SSA返回值的个数必须为1
     if (user->getNumResults() != 1)
       return std::nullopt;
+    // 链上已有 memdesc：记下其 shared encoding，再递归看 memdesc 的 users
     if (auto memDesc =
             dyn_cast<triton::gpu::MemDescType>(user->getResult(0).getType())) {
       // First time we find a shared encoding in the chain, save it and try to
@@ -1164,23 +1168,48 @@ getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible) {
                .has_value())
         return std::nullopt;
     } else {
-      if (!isa<ttg::LocalLoadOp, ttg::ConvertLayoutOp>(user))
+      // 链上没有 memdesc：只有普通 load 和 convert
+      if (!isa<ttg::LocalLoadOp, ttg::ConvertLayoutOp>(user))//user 是 convert_layout
         return std::nullopt;
-      auto srcTy = cast<triton::gpu::TensorOrMemDesc>(val.getType());
-      auto dstTy = cast<RankedTensorType>(user->getResult(0).getType());
+      // 取出源/目标类型，并决定用哪边的 CGA layout。
+      // srcTy / val 是 load 的结果 tensor<128x32xf16, #blocked>。
+      auto srcTy = cast<triton::gpu::TensorOrMemDesc>(val.getType());// tensor<128x32xf16, #blocked>
+      /*
+      这里对load的结果做了一个convert_layout，结果是：tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>
+      注意，这里的convert_layout不是转置，而是换layout encoding，即从 #blocked 换到 #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>
+      元素怎么映射到 thread/寄存器，好喂 MMA？这个在swizzleDotOperandLike函数里实现。
+      */
+    
+      /*
+      这里的#ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}是在lp2中就已经存在的了，
+      是在matmul相关pass中生成的
+      load 用 #blocked 好读 GMEM，dot 要用 #dot_op 好喂 MMA，所以中间插一个 convert_layout。
+      这里只是把这个layout取出来
+      */
+      auto dstTy = cast<RankedTensorType>(user->getResult(0).getType());// tensor<128x32xf16, #ttg.dot_op<...>>
 
       // FIXME This may not be correct for multiple CTA, but getCGALayout is NYI
       // for LinearEncodingAttr
+      // getEncoding： 取出类型上的 layout 属性
       auto CGALayout = isa<ttg::LinearEncodingAttr>(dstTy.getEncoding())
-                           ? ttg::getCGALayout(srcTy.getEncoding())
-                           : ttg::getCGALayout(dstTy.getEncoding());
-
+                           ? ttg::getCGALayout(srcTy.getEncoding()) //#blocked
+                           : ttg::getCGALayout(dstTy.getEncoding());//#ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>
+      // dstTy = convert_layout 的结果类型，即：
+      // RankedTensorType: tensor<128x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>
       if (auto dot =
-              dyn_cast<ttg::DotOperandEncodingAttr>(dstTy.getEncoding())) {
-        auto order = getOrderForMemory(srcTy);
-        unsigned bitWidth = srcTy.getElementTypeBitWidth();
+              // #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}的c++类型就是ttg::DotOperandEncodingAttr所以可以cast
+              dyn_cast<ttg::DotOperandEncodingAttr>(dstTy.getEncoding())) {//dstTy.getEncoding()得到的结果是#ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}，表示他是一个dot_op，所以dot不为空
+        auto order = getOrderForMemory(srcTy);// srcTy：tensor<128x32xf16, #blocked>
+        unsigned bitWidth = srcTy.getElementTypeBitWidth();// fp16, 16 bits
+        // 得到 后面 local_alloc / async_copy 要用的 SMEM layout
+        // 即：#ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>，对应lp3 里的 #shared
         tempAttr = ttg::SwizzledSharedEncodingAttr::get(
-            val.getContext(), dot, srcTy.getShape(), order, CGALayout, bitWidth,
+            val.getContext(), 
+            dot, // #ttg.dot_op{opIdx, parent=#mma, kWidth}
+            srcTy.getShape(), // [128,32] 或 [32,128]
+            order, // 通常 [1,0]
+            CGALayout, 
+            bitWidth,// f16 → 16
             /*needTrans=*/false);
       } else {
         // Try to see if the layout is like an mma microtile

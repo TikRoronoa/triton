@@ -1,0 +1,11 @@
+CompileFlags:
+  CompilationDatabase: .
+  Add:
+    - -Wno-unused-command-line-argument
+
+# Keep background index for cross-TU go-to-def, but avoid thrashing RAM.
+Index:
+  Background: Build
+
+Diagnostics:
+  Suppress: '*'

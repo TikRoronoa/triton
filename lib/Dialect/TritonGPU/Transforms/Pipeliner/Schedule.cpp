@@ -248,6 +248,10 @@ static std::optional<int> tryGetMaxStage(scf::ForOp &forOp) {
 }
 
 // Set <stage, cluster> based on CoarseSchedule.
+/*
+遍历已排的 op → 写上 loop.stage / loop.cluster
+在 scf.for 上写 tt.scheduled_max_stage（基础的matmul是 2）
+*/
 void tt::CoarseSchedule::serialize(scf::ForOp &forOp) const {
   for (auto [op, stage, cluster] : getOpsInOrder(forOp)) {
     setStageCluster(op, stage, *cluster);
@@ -264,6 +268,7 @@ void tt::CoarseSchedule::serialize(scf::ForOp &forOp) const {
 // Create a CoarseSchedule based on forOp's <stage, cluster>.
 LogicalResult tt::CoarseSchedule::deSerialize(scf::ForOp &forOp,
                                               bool normalizeClusterId) {
+  // 返回一个forOp中的所有operation中的最大clusterID和最小clusterID
   auto [minClusterId, maxClusterId] = getMinMaxCluster(forOp);
   std::optional<int> maxStage = tryGetMaxStage(forOp);
   if (!maxStage) {
@@ -281,11 +286,13 @@ LogicalResult tt::CoarseSchedule::deSerialize(scf::ForOp &forOp,
       clustersMap.insert({i, clusters.newAtBack()});
     }
   }
-
+  // 把所有包含loop.stage的op都写到一个{op，stage， cluster}的map中（opToStageAndCluster）
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (!op.hasAttr(mlir::triton::kLoopStageAttrName))
       continue;
+    // 拿到op的stage 以及 cluster信息
     auto [stage, clusterId] = getStageCluster(&op);
+    // 把IR中的op的stage 以及 cluster信息读到内存中,存到CoarseSchedule的map中
     insert(&op, stage, clustersMap[clusterId]);
   }
   return success();
@@ -403,11 +410,13 @@ bool tt::CoarseSchedule::LinearizedIterator::operator!=(
   return !(*this == other);
 }
 
+// 按 stage 从早到晚，把已排 op 的依赖（定义链上的未排 op）
+// 拉进与该 op 相同的 stage/cluster（insertDepsOfOp）。
 void tt::scheduleDependencies(scf::ForOp forOp, tt::CoarseSchedule &schedule) {
   int numStages = schedule.getNumStages();
   SmallVector<std::tuple<Operation *, int, tt::CoarseSchedule::Cluster>>
       opsInOrder = schedule.getOpsInOrder(forOp);
-  // Schedule dependencies stage by stage.
+  // 逐 stage 处理，保证依赖先于/同于使用者被纳入 schedule。
   for (int stage = 0; stage < numStages; stage++) {
     for (auto [op, stage_, cluster] : opsInOrder) {
       if (stage_ != stage)

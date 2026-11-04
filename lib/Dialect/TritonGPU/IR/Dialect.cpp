@@ -114,8 +114,8 @@ Attribute inferEncodingFromLinearLayout(MLIRContext *ctx, LinearLayout ll,
 }
 
 GenericLinearEncodingAttr
-toGenericLinearEncoding(DistributedEncodingTrait layout,
-                        ArrayRef<int64_t> shape) {
+toGenericLinearEncoding(DistributedEncodingTrait layout,//#blocked
+                        ArrayRef<int64_t> shape) {// [128, 32]
   auto ll = toLinearLayout(shape, layout);
   return GenericLinearEncodingAttr::get(layout.getContext(), std::move(ll));
 }
@@ -293,13 +293,13 @@ SmallVector<unsigned> getOrder(DistributedEncodingTrait layout,
                                ArrayRef<int64_t> shape) {
   return toGenericLinearEncoding(layout, shape).getOrder();
 }
-
-SmallVector<unsigned> getOrderForMemory(DistributedEncodingTrait layout,
-                                        ArrayRef<int64_t> shape) {
+//根据分布式 layout，选一个“往 shared memory 里存时更合理的维度顺序”
+SmallVector<unsigned> getOrderForMemory(DistributedEncodingTrait layout, // #blocked
+                                        ArrayRef<int64_t> shape) { // [128, 32]
   auto linear = toGenericLinearEncoding(layout, shape);
-  auto order = linear.getOrder();
-  auto threadOrder = linear.getThreadOrder();
-  if (order == threadOrder) {
+  auto order = linear.getOrder();//元素/布局的默认维度序
+  auto threadOrder = linear.getThreadOrder();// 线程分布的维度序
+  if (order == threadOrder) {//对于GEMM来说，直接return
     return order;
   }
   // Heuristic:

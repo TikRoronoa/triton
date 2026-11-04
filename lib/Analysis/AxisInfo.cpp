@@ -1360,20 +1360,24 @@ AxisInfoAnalysis::loadDefaultAnalysis(DataFlowSolver *solver) {
   return solver->load<AxisInfoAnalysis>();
 }
 
-unsigned ModuleAxisInfoAnalysis::getContiguity(Value value) {
-  auto tensorTy = dyn_cast<RankedTensorType>(value.getType());
+// GEMM 的 A load中：
+// %11 = tt.load %arg6 : tensor<128x32x!tt.ptr<f16>, #blocked>
+// %arg6 类型：一堆指向 f16 的指针，布局 #blocked，order 常为 [1, 0]
+unsigned ModuleAxisInfoAnalysis::getContiguity(Value value) {// 这里的value为tensor<128x32x!tt.ptr<f16>, #blocked>
+  auto tensorTy = dyn_cast<RankedTensorType>(value.getType());//tensor<128x32x!tt.ptr<f16>, #blocked>
   if (!tensorTy)
     return 1;
-  auto elemTy = tensorTy.getElementType();
+  auto elemTy = tensorTy.getElementType();// !tt.ptr<f16>
   // Get the pointee type if we have a tensor of ptrs to compute contiguity for
   if (auto ptrTy = dyn_cast<PointerType>(elemTy)) {
-    elemTy = ptrTy.getPointeeType();
+    elemTy = ptrTy.getPointeeType();// f16
   }
-  return getContiguity(value, elemTy.getIntOrFloatBitWidth());
+  return getContiguity(value, elemTy.getIntOrFloatBitWidth());// 16
 }
-
-unsigned ModuleAxisInfoAnalysis::getContiguity(Value offsetsValue,
-                                               unsigned elementBitWidth) {
+//上一个函数，从“指针 tensor”剥到 元素类型 f16
+// 这里返回4，即：一个thread最多能连续读 4 个 f16。
+unsigned ModuleAxisInfoAnalysis::getContiguity(Value offsetsValue,//tensor<128x32x!tt.ptr<f16>, #blocked>
+                                               unsigned elementBitWidth) {// 16
   // FIXME: This is not as good as it could be, as we don't need to restrict
   // the analysis to one dimension. We should determine contiguity on the
   // flattenOuts() layout

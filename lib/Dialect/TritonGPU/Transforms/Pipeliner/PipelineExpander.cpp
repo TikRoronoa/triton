@@ -131,9 +131,9 @@ bool LoopPipelinerInternal::initializeLoopInfo(
     ForOp op, const triton::PipeliningOption &options) {
   LDBG("Start initializeLoopInfo");
   forOp = op;
-  ub = forOp.getUpperBound();
-  lb = forOp.getLowerBound();
-  step = forOp.getStep();
+  ub = forOp.getUpperBound();//上界（结束，如 K 到哪结束）
+  lb = forOp.getLowerBound();//下界（起始，如 K 从哪开始）
+  step = forOp.getStep();//步长（一块 K-tile 多大）
 
   std::vector<std::pair<Operation *, unsigned>> schedule;
   options.getScheduleFn(forOp, schedule);
@@ -142,6 +142,12 @@ bool LoopPipelinerInternal::initializeLoopInfo(
     return false;
   }
 
+  /*
+  把 getScheduleFn 拿到的 finalSchedule（{op, stage} 列表）拆进三个内部结构：
+  stages[op] = stage ：每个 op 的 stage（查表用）
+  opOrder： op 的顺序列表（clone 进 prologue/kernel 时按这个序）
+  maxStage： 最大 stage 号（3 stage 时一般为 2）
+  */
   opOrder.reserve(schedule.size());
   for (auto &opSchedule : schedule) {
     maxStage = std::max(maxStage, opSchedule.second);
@@ -150,6 +156,7 @@ bool LoopPipelinerInternal::initializeLoopInfo(
   }
 
   dynamicLoop = true;
+  //在问：循环的 ub/lb/step 是不是编译期常量。
   auto upperBoundCst = ub.getDefiningOp<arith::ConstantIndexOp>();
   auto lowerBoundCst = lb.getDefiningOp<arith::ConstantIndexOp>();
   auto stepCst = step.getDefiningOp<arith::ConstantIndexOp>();
@@ -158,7 +165,7 @@ bool LoopPipelinerInternal::initializeLoopInfo(
       LDBG("--dynamic loop not supported -> BAIL");
       return false;
     }
-  } else {
+  } else {//在 lb/ub/step 都是常量 的前提下，已经算出静态迭代次数 numIteration
     int64_t ubImm = upperBoundCst.value();
     int64_t lbImm = lowerBoundCst.value();
     int64_t stepImm = stepCst.value();
@@ -190,6 +197,7 @@ bool LoopPipelinerInternal::initializeLoopInfo(
     }
   }
 
+  //检查：按当前 stage + opOrder 展开后，会不会出现「消费者比生产者还早执行」。
   if (!verifySchedule()) {
     LDBG("--invalid schedule: " << op << " -> BAIL");
     return false;
@@ -281,11 +289,31 @@ bool LoopPipelinerInternal::verifySchedule() {
 static Operation *
 cloneAndUpdateOperands(RewriterBase &rewriter, Operation *op,
                        function_ref<void(OpOperand *newOperand)> callback) {
+  // clone一个op
   Operation *clone = rewriter.clone(*op);
+  /*
+  第一次，lambda的参数nested就是clone后的op
+  若这条 op 带 region（如 scf.if），walk 还会继续进内部，后面的 nested 是 region 里嵌套的子 op。
+  对 GEMM 里常见的扁平 async_copy / commit：没有内嵌 region，整个 walk 往往只有一次，nested == clone。
+  */
   clone->walk<WalkOrder::PreOrder>([&](Operation *nested) {
     // 'clone' itself will be visited first.
     for (OpOperand &operand : nested->getOpOperands()) {
+      /*
+      operand ：某个 OpOperand（「这个 op 的第几个输入槽」）。
+                比如 GEMM 的 async_copy，有 4 个输入槽：%ptrA, %slot0, %mask, %other。
+                operand 就是 %ptrA, %slot0, %mask, %other 中的一个。
+                operand.get() 就是 %ptrA, %slot0, %mask, %other 中的一个 Value。
+     getDefiningOp() ：找到对应的SSA value定义的地方。返回 Operation*。若无，返回 nullptr。
+     例如：async_copy 的指针操作数若来自 %p = tt.addptr ...，则 getDefiningOp() 是那条 addptr；
+          若来自 for 的 %arg6，则是 nullptr，后面靠 isa<BlockArgument> 识别。
+      */
       Operation *def = operand.get().getDefiningOp();
+      /*
+      判断clone是否是def的祖先，也就是op是否是oprand的祖先
+      clone 刚复制完时，操作数仍指向 旧 for / 外面 的 op，此时为false，此时交给callback做valueMapping替换
+      操作数由 clone 内部 新定义的子 op 提供，此时为true
+      */
       if ((def && !clone->isAncestor(def)) || isa<BlockArgument>(operand.get()))
         callback(&operand);
     }
@@ -295,6 +323,39 @@ cloneAndUpdateOperands(RewriterBase &rewriter, Operation *op,
 
 LogicalResult LoopPipelinerInternal::emitPrologue(RewriterBase &rewriter) {
   // Initialize the iteration argument to the loop initiale values.
+  /*
+  以 lower 之后、expand 之前 的 GEMM for 为例（概念上）：
+  scf.for %iv = %lb to %ub step %step
+      iter_args(
+        %ptrA    = %initA,    // 初值：第一块 A 指针
+        %ptrB    = %initB,
+        %acc     = %cst0,     // 累加器 0
+        %insert  = %c-1,
+        %extract = %c0
+      ) {
+    // body 里用 %ptrA, %acc, ...
+    %copy = async_copy %ptrA, ...
+    ...
+    scf.yield %nextA, %nextB, %newAcc, %nextIns, %nextExt
+  }
+  下面的这两行代码建立起：key（body 里的名字）-> value（iter_args 的初值）的 mapping
+  %ptrA -> %initA
+  %ptrB -> %initB
+  %acc -> %cst0
+  %insert -> %c-1
+  %extract -> %c0
+  为什么需要这个 mapping？
+  Prologue 要在 for 外面 clone 第 0 轮的 async_copy。
+  Body 里写的是 %ptrA，for 外没有这个 block arg，所以 clone 时查表：
+      version=0 的 %ptrA → 用 %initA 替换
+  于是 prologue 里变成：
+  // 相当于 S0(0)
+  %copy0 = async_copy %initA, %slot0, ...
+  而不是非法的 async_copy %ptrA。
+  setValueMapping 本身:
+  valueMapping[key][idx] = el：同一个 SSA 概念值可以有多版（prologue 第 0、1 段…）。这里只初始化 第 0 版 = 循环 init。
+  这里只是记录一个mapping，方便后面clone使用
+  */
   for (auto [arg, operand] :
        llvm::zip(forOp.getRegionIterArgs(), forOp.getInitsMutable())) {
     setValueMapping(arg, operand.get(), 0);
@@ -303,6 +364,7 @@ LogicalResult LoopPipelinerInternal::emitPrologue(RewriterBase &rewriter) {
   // If the incoming value to an iter arg from the loop yield is defined outside
   // the loop, then that means the iter arg takes that value for all stages
   // after the first stage.
+  //这段GEMM不会执行
   auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   for (auto [arg, operand] :
        llvm::zip(forOp.getRegionIterArgs(), yield->getOpOperands())) {
@@ -324,15 +386,98 @@ LogicalResult LoopPipelinerInternal::emitPrologue(RewriterBase &rewriter) {
             rewriter, loc, step,
             arith::ConstantOp::create(rewriter, loc,
                                       rewriter.getIntegerAttr(t, i))));
+    /*
+    建立 induction variable 的 mapping， 
+    valueMapping[ 原for的inductionVar ][ 版本号 i ] = 刚算好的 iv表达式
+    */
     setValueMapping(forOp.getInductionVar(), iv, i);
 
+    /*
+    arith.cmpi，谓词是 slt（signed less than）：
+    %pred_i = arith.cmpi slt, %iv, %ub : index
+    */
     if (dynamicLoop) {
       // pred = ub > lb + (i * step)
       predicates[i] = arith::CmpIOp::create(rewriter, loc,
                                             arith::CmpIPredicate::slt, iv, ub);
     }
+    /*
+    opOrder = [
+      convert_A, convert_B, mulf, dot,   // stage 2, cluster 0
+      addptr_A, addptr_B,                // stage 1, cluster 2
+      load_A, load_B                     // stage 0, cluster 3
+    ]
+    cluster可以排出dot addptr load指令在一个forloop中的先后顺序
+    */
 
+    /*
+    只用 A 的指针 把 这个for循环走一遍
+
+    原 body 里相关的两件事：
+    scf.for ... iter_args(%ptrA = %initA, ...) {
+      // stage 0
+      %tok = async_copy %ptrA, ...
+
+      // stage 1
+      %nextA = addptr %ptrA, 4
+
+      scf.yield %nextA, ...   // %nextA 交给下一轮的 %ptrA
+    }
+    yield 的第 0 个操作数是 %nextA → 对应 iter_arg %ptrA。
+
+    时刻 0：只 clone stage 0（copy）
+    开头表：%ptrA[0] = %initA
+    clone async_copy：
+    1.查表用 %ptrA[0] → %initA
+    2.copy 的结果是 token，不是 yield 给 %ptrA 的那个值
+    3.内层 if (operand.get() != op->getResult(...)) 对 %ptrA 对不上 → 531 这行对 %ptrA 不执行
+    表不变：%ptrA[0] 仍是 %initA。
+    lp3 对应：第一次 async_copy %4, 槽0。
+
+    时刻 1：先 clone addptr（stage 1）——531行 在这里开火
+    i=1，stages[addptr]=1。
+    ① clone
+    读操作数：%ptrA[i-stage] = %ptrA[0] = %initA
+    得到：%23 = addptr %initA, 4
+    ② 发现 %nextA 被 yield
+    operand.get() == addptr 的结果   // 命中
+    → setValueMapping(%ptrA, %23, i - stages[op] + 1)
+    //                              1 - 1 + 1 = 1
+    表变成：
+    %ptrA[0] = %initA
+    %ptrA[1] = %23      ← 就是 531–534 写进去的
+    含义：原循环里「下一轮的 %ptrA」= %nextA；prologue 里这个下一版就是 %23。
+
+    时刻 1：再 clone 第二次 async_copy（stage 0）
+    读：%ptrA[i-stage] = %ptrA[1-0] = %ptrA[1] = %23
+    ⇒ async_copy %23, 槽1
+    lp3 里第二次 copy 用的就是 %23。
+    若没有 531–534： %ptrA[1] 空着，第二次 copy 还是用 %initA，两块都拷同一地址 → 错。
+
+    对照代码三个参数：
+    setValueMapping(
+      forOp.getRegionIterArgs()[...],  // key = %ptrA（iter_arg，不是 %nextA）
+      source,                          // el  = %23（clone 出的 addptr 结果）
+      i - stages[op] + 1);             // idx = 1（下一版）
+    --------------------------------
+    key：原 for 里的 iter_arg %ptrA
+    el：clone 出的 addptr 结果 %23
+    idx：下一版下标 1
+
+    时间线小结
+    init:        %ptrA[0]=%initA
+
+    i=0 copy:    用 [0]，不写 %ptrA
+
+    i=1 addptr:  用 [0] 算出 %23
+                466行：%ptrA[1]=%23     ← 你问的这句
+
+    i=1 copy:    用 [1] 即 %23
+    */
     for (Operation *op : opOrder) {
+      /*
+      若 op 的 stage 大于 i，则跳过（因为 op 还没执行到）。
+      */
       if (stages[op] > i)
         continue;
       Operation *newOp =
@@ -343,6 +488,7 @@ LogicalResult LoopPipelinerInternal::emitPrologue(RewriterBase &rewriter) {
               newOperand->set(replacement);
             }
           });
+      //这里是处理越界的corner case，可以先跳过这里
       int predicateIdx = i - stages[op];
       if (predicates[predicateIdx]) {
         OpBuilder::InsertionGuard insertGuard(rewriter);
@@ -350,11 +496,25 @@ LogicalResult LoopPipelinerInternal::emitPrologue(RewriterBase &rewriter) {
         if (newOp == nullptr)
           return failure();
       }
-      if (annotateFn)
+      if (annotateFn)//GEMM跳过这里
         annotateFn(newOp, triton::PipeliningOption::PipelinerPart::Prologue, i);
+      /*
+      遍历这条 op 的每个结果：
+      addptr → 1 个结果（新指针）
+      async_copy → 1 个 token（作为下一步的 waitToken）
+      dot → 1 个 acc（prologue 里通常 stage 不够，不会走到这里）
+      */
       for (unsigned destId : llvm::seq(unsigned(0), op->getNumResults())) {
         Value source = newOp->getResult(destId);
         // If the value is a loop carried dependency update the loop argument
+        /*
+        原 body 里，这个 op 的结果有没有被 scf.yield 交给下一轮 iter_arg
+        addptr 会命中：
+        %nextA = tt.addptr %ptrA, 4      // op 的 result
+        scf.yield %nextA, ...            // yield 带走 → 对应 iter_arg %ptrA
+        命中后做setValueMapping(%ptrA,  i - stages[addptr] + 1);
+        把「yield 出去的那个新值」记成对应 iter_arg 的下一版。
+        */
         for (OpOperand &operand : yield->getOpOperands()) {
           if (operand.get() != op->getResult(destId))
             continue;
@@ -368,8 +528,9 @@ LogicalResult LoopPipelinerInternal::emitPrologue(RewriterBase &rewriter) {
             source = arith::SelectOp::create(
                 rewriter, loc, predicates[predicateIdx], source, prevValue);
           }
-          setValueMapping(forOp.getRegionIterArgs()[operand.getOperandNumber()],
-                          source, i - stages[op] + 1);
+          setValueMapping(forOp.getRegionIterArgs()[operand.getOperandNumber()],// 如 %ptrA
+                          source,// clone 出的新值，如 %23
+                           i - stages[op] + 1);//下一版下标
         }
         setValueMapping(op->getResult(destId), newOp->getResult(destId),
                         i - stages[op]);

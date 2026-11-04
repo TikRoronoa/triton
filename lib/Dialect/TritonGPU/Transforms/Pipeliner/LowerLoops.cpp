@@ -156,33 +156,74 @@ void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
                      CoarseSchedule &schedule) {
   OpBuilderForStage builder(loadOp.getLoc(), forOp, schedule);
 
+  //返回第一个使用load结果的op，这里就是convert_layout
   Operation *firstUse = getFirstUseOfPipelinedOp({loadOp}, forOp, schedule);
   assert(firstUse && "LoadOp has no users");
   // Replace the load with async copy, wait and loal_load.
-  OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPoint(loadOp);
-  builder.setStageCluster(schedule[loadOp]);
-  Value src = loadOp.getPtr();
+  OpBuilder::InsertionGuard guard(builder);//作用域结束时恢复 builder 插入点
+  builder.setInsertionPoint(loadOp); //新 op 插在 loadOp 前面
+  builder.setStageCluster(schedule[loadOp]);//后续创建的 op 继承 load 的 stage/cluster（GEMM 里 stage=0, cluster=3
+  Value src = loadOp.getPtr();//从原 load 取出指针、mask、other，后面交给 AsyncCopyGlobalToLocal
   Value mask = loadOp.getMask();
   Value other = loadOp.getOther();
 
   // Create async copy
+  //从多缓冲 alloc（形状 N × tile）里，用 insertIdx 切出当前要写入的那一槽。（这里N=2，tile=128x32）
   Value view = createSingleBufferView(builder, alloc, insertIdx);
+  /*
+  这两行创建 ttg.async_copy_global_to_local：
+  用原 tt.load 的语义，但目标改成 shared 上的 view（异步，对应 Ampere cp.async）
+  返回值是 async token，下一行 AsyncCommitGroupOp 把它收成一组，之后才能 async_wait。
+  %view = ttg.memdesc_index %allocA, %insertIdx
+  %token = ttg.async_copy_global_to_local %src, %view ...
+  %commit = ttg.async_commit_group %token
+  */
   Operation *copy = ttg::AsyncCopyGlobalToLocalOp::create(
-      builder, src, view, mask, other, loadOp.getCache(), loadOp.getEvict(),
-      loadOp.getIsVolatile(), contiguity);
+      builder, 
+      src, //原 load 的指针
+      view, //当前写槽（memdesc_index(alloc, insertIdx)）
+      mask, other,//mask，other与原 load 相同 
+      loadOp.getCache(), loadOp.getEvict(),//原 load 属性原样带上
+      loadOp.getIsVolatile(), 
+      contiguity);//向量化宽度提示（前面 canBeConvertedToAsyncLoad / axis 分析算出的）
   Operation *commit =
       ttg::AsyncCommitGroupOp::create(builder, copy->getResult(0));
 
   // Create wait and local load
+  //后面插的 op 改用 消费者 的拍（GEMM A：convert 的 stage=2），不再跟 load 的 stage=0
   builder.setStageCluster(schedule[firstUse]);
+  /*
+  这两行创建 ttg.async_wait 和 ttg.local_load：
+  等 commit 结束（组内所有 copy 完成），再从 shared 上读取当前槽（异步，对应 Ampere cp.wait）
+  %wait = ttg.async_wait %commit
+  %viewLoad = ttg.memdesc_index %allocA, %extractIdx
+  %localLoad = ttg.local_load %viewLoad ...
+  // stage 0: copy + commit（前面已设）
+  // stage 2（firstUse）:
+  %wait = ttg.async_wait %commit {num = 0}
+  %viewLoad = ttg.memdesc_index %allocA, %extractIdx
+  // 接着 local_load %viewLoad, %wait → 替换原 load 的 uses
+  */
   auto wait = ttg::AsyncWaitOp::create(builder, commit->getResult(0), 0);
   auto viewLoad = createSingleBufferView(builder, alloc, extractIdx);
 
-  if (!loadOp.getOther() || isZeroConst(loadOp.getOther())) {
+  if (!loadOp.getOther() || isZeroConst(loadOp.getOther())) {//GEMM走这个分支，因为A的mask恒为0
     // If masking isn't required, load directly from shared
-    replaceUsesWithLocalLoad(builder, loadOp->getResult(0), viewLoad,
-                             wait.getResult());
+    /*
+    函数会新建：
+    %ll = ttg.local_load %viewLoad, %waitToken
+        : !ttg.memdesc<128x32xf16, ...> -> tensor<128x32xf16, #blocked>
+    其他使用load的结果的op，都会被替换成这个新的local_load
+    // 之前
+    %12 = ttg.convert_layout %11 ...
+    // 之后
+    %12 = ttg.convert_layout %ll ...
+
+    */
+    replaceUsesWithLocalLoad(builder, 
+                            loadOp->getResult(0), //load的结果（tensor<128x32xf16>）
+                            viewLoad, //当前读槽（memdesc_index(alloc, extractIdx)）（tensor<128x32xf16>），本地load的指针
+                            wait.getResult()); //wait token
   } else if (loadOp->use_begin() != loadOp->use_end()) {
     // Otherwise, create a select for non-zero other values as they are not
     // handled by AsyncCopyGlobalToLocalOp for now.
@@ -441,17 +482,20 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   // Only visit the top level ops, we do not support pipelining conditional
   // loads for now
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (isa<tt::LoadOp, tt::DescriptorLoadLikeOpInterface>(op)) {
-      int stageDiff = getDefUseStageDiff(&op, forOp, schedule);
-      if (stageDiff == 0) {
+    if (isa<tt::LoadOp, tt::DescriptorLoadLikeOpInterface>(op)) {//只看普通 tt.load 和 TMA 类 load，GEMM 是前者
+      // GEMM：load 在 stage 0，convert/dot 在 stage 2 → stageDiff = 2。
+      int stageDiff = getDefUseStageDiff(&op, forOp, schedule);//消费者的 stage − load 的 stage
+      if (stageDiff == 0) {//同一 stage，不考虑
         // Don't care about non-pipelined loads. Scalar loads will be converted
         // to tensor loads if they are pipelined.
         continue;
       }
+      // 判断load是否可以走cp.async
       SharedEncodingTrait sharedEncoding;
       bool canUseAsyncCp = false;
       int contiguity = 1;
-      if (!isa<RankedTensorType>(op.getResultTypes()[0])) {
+      if (!isa<RankedTensorType>(op.getResultTypes()[0])) {// 结果不是 ranked tensor → 标量 load
+        // cp.async 对太窄的类型不划算/不好用，至少 32 bit（f32/i32/i64 等）才考虑异步。
         canUseAsyncCp = op.getResultTypes()[0].getIntOrFloatBitWidth() >= 32;
         auto numCTAs = lookupNumCTAs(forOp);
         sharedEncoding = ttg::SwizzledSharedEncodingAttr::get(
@@ -460,16 +504,20 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         if (canUseAsyncCp) {
           scalarLoads.push_back(&op);
         }
-      } else {
+      } else {// tensor load
+        // 这里是 tensor load（GEMM 即 tt.load）
+        // 选出 从GMEM load 到 SMEM 的 shared encoding（#ttg.swizzled_shared）
+        // 后面 createAlloc 会用它生成!ttg.memdesc<2x128x32xf16, #shared, #smem, mutable>里面的 #shared 的 encoding
         sharedEncoding = getSharedEncoding(&op);
         // Do not create async loads for small loads (cp.async requires at least
         // 4 bytes)
         canUseAsyncCp =
             isa<tt::LoadOp>(op) &&
-            canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis);
+            canBeConvertedToAsyncLoad(cast<tt::LoadOp>(op), axisInfoAnalysis);// true
+        // 寄存器 layout → shared layout 拷贝时，每线程实际能连续写多少 字节
         int copyVecBytes = getCopyVecBytes(
             cast<RankedTensorType>(op.getResultTypes()[0]), sharedEncoding);
-
+        // 看 写入 SMEM 时 的向量宽：cp.async 至少 4 字节
         canUseAsyncCp &= copyVecBytes >= 4;
         if (canUseAsyncCp) {
           auto loadOp = cast<tt::LoadOp>(op);
@@ -482,14 +530,26 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         }
       }
       if (canUseAsyncCp || isTMALoad(&op)) {
-        if (loadRequiresAdditionalBuffer(&op)) {
+        if (loadRequiresAdditionalBuffer(&op)) {// for Hopper
           // Allocate additional buffer required by the wgmma pipelining.
           stageDiff += 1;
         }
+        // asyncLoads 记录所有 load 的 stageDiff、contiguity、sharedEncoding
+        /*
+        llvm::MapVector<Operation *, AsyncLoad> asyncLoads;
+        struct AsyncLoad {
+          int stageDiff;
+          int contiguity = 1;
+          Value alloc;
+          Value barrier;
+          Operation *waitOp;
+          SharedEncodingTrait sharedEncoding;
+        };
+        */
         auto &asyncLoad = asyncLoads[&op];
         asyncLoad.stageDiff = stageDiff;
         asyncLoad.contiguity = contiguity;
-        asyncLoad.sharedEncoding = sharedEncoding;
+        asyncLoad.sharedEncoding = sharedEncoding;//#ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>
       } else if (stageDiff > 1) {
         // Distance-1 loads can in most cases be pipelined in registers without
         // any performance degradation, as the schedule will usually reorder the
@@ -504,7 +564,7 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   }
 
   // Convert scalar loads to be able to use async copy.
-  for (auto op : scalarLoads) {
+  for (auto op : scalarLoads) {// GEMM会跳过这里
     convertScalarToTensorLoad(op, schedule, forOp);
   }
 
@@ -512,15 +572,29 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     return forOp;
 
   for (auto &[loadOp, asyncLoad] : asyncLoads) {
+    /*
+    asyncLoad.stageDiff = 2
+    createAlloc 把 distance 插到 shape 最前面，以A为例：
+    !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable>
+                 ↑
+        distance = stageDiff
+    运行时用 insertIdx / extractIdx（0 或 1）做 memdesc_index，
+    一轮写 slot0、用 slot1，下一轮对调，避免 producer/consumer 踩同一块。
+    */
+    // %10 = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable>
+    // createAlloc会在forOp之前插入local_alloc
     Value alloc = createAlloc(forOp, loadOp, asyncLoad.sharedEncoding,
                               asyncLoad.stageDiff);
     asyncLoad.alloc = alloc;
+    /*
+    insert({2, {}})：为深度 2 建一个空的 LoadGroupInfo（A、B 的 stageDiff 都是 2 → 进同一组，只建一次）
+    */
     loadGroups.insert({asyncLoad.stageDiff, {}});
     if (isTMALoad(loadOp)) {
       loadGroups[asyncLoad.stageDiff].hasTMALoad = true;
     }
   }
-
+  //下面准备rewrite这个forOp，从这里开始改 forOp
   IRRewriter builder(forOp);
   builder.setInsertionPoint(forOp);
   Location loc = forOp.getLoc();
@@ -532,10 +606,18 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
   Value one = arith::ConstantIntOp::create(builder, loc, 1, 32);
   SmallVector<Value> newOperands;
+  /*
+  拿到forOp的参数个数：1个循环变量和3个变量
+  scf.for %arg5 = %arg0 to %arg1 step %arg2 iter_args(...)
+          ^^^^^
+     induction var
+  %arg0 / %arg1 / %arg2：下界、上界、步长
+  %arg5：每轮 += step 的那个（常叫 iv）
+  */
   unsigned newOperandIndex = forOp.getBody()->getNumArguments();
   for (auto [_, loadGroup] : loadGroups) {
-    newOperands.push_back(minusOne); // insertIdx
-    newOperands.push_back(minusOne); // extractIdx
+    newOperands.push_back(minusOne); // insertIdx，写SMEM的idx，初始值是-1
+    newOperands.push_back(minusOne); // extractIdx，读SMEM的idx，初始值是-1
     if (loadGroup.hasTMALoad) {
       // A single barrier arrival sequence is a "phase" and two phases can
       // overlap, provided the phases are differentiated with an alternating
@@ -545,9 +627,17 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   }
 
   // Patch the loop to add the new loop carried dependencies.
+  // 用 newOperands（-1, -1）重建一个带更多 iter_args 的 scf.for，旧 loop 删掉。
+  // 主体 ops 没换逻辑，只是换了个带更多 iter_args 的新 scf.for，并把旧 body 搬过去。
   forOp = addIterArgsToLoop(builder, forOp, newOperands);
 
   // Update yield op with temporary yield values
+  /*
+  addIterArgsToLoop 刚加了新 iter_args，scf.yield 也必须多 yield 同样个数，否则非法。
+  scf.for 的约定是：
+  iter_args 个数 = yield 操作数个数 = for 的 result 个数
+  每一轮结束，yield 的值变成下一轮的 iter_args；循环结束后又是 for 的返回值。少 yield 一个，类型/SSA 对不上，IR 非法。
+  */
   auto forYield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   for (unsigned i = 0; i < newOperands.size(); ++i) {
     forYield.getResultsMutable().append(newOperands[i]);
@@ -556,10 +646,19 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   builder.setInsertionPoint(forOp);
   loc = forOp.getLoc();
   int argIdx = newOperandIndex;
-  for (auto &[numBuffers, loadGroup] : loadGroups) {
-    Value insertIdx = forOp.getBody()->getArgument(argIdx);
+  /*
+  struct LoadGroupInfo {
+    Value insertIdx;     //4
+    Value extractIdx;    //5
+    Value phase;//nullptr        // 仅 TMA 时才有
+    bool hasTMALoad;
+  };
+  */
+  for (auto &[numBuffers, loadGroup] : loadGroups) {//loadGroups有且只有一个item：{2, LoadGroupInfo}
+    // 从刚挂上的 iter_args 里把 insert/extract 下标取出来。
+    Value insertIdx = forOp.getBody()->getArgument(argIdx);//argIdx是4， insertIdx是-1
     argIdx++;
-    Value extractIdx = forOp.getBody()->getArgument(argIdx);
+    Value extractIdx = forOp.getBody()->getArgument(argIdx);//argIdx是5， extractIdx是-1
     argIdx++;
     Value phase = nullptr;
     if (loadGroup.hasTMALoad) {
@@ -569,16 +668,60 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
 
     // Create two counters for the insert and extract indices to avoid creating
     // long liverange.
+    //在 body 最前面插 IR。这样后面的 async_copy / local_load 才能用到本轮刚算出来的 idx。
+    /*
+    ^bb:
+      // ← 这里插入 idx 更新，就是 insertIdx 和 extractIdx 的更新
+      ... async_copy / wait / local_load / dot / addptr ...
+      scf.yield ...
+    */
     builder.setInsertionPoint(forOp.getBody(), forOp.getBody()->begin());
 
+    /*
+    这行把 更新后的 insert 下标 写回 loadGroup：
+    loadGroup.insertIdx = (旧 insertIdx + 1) % numBuffers //(-1 + 1) % 2 = 0
+    右边的 insertIdx：本轮从 iter_args 取的旧值（第一轮是 -1）
+    左边：新 Value（第一轮是 0），后面给 async_copy 的 memdesc_index，并 yield 给下一轮
+    */
+    // 这两个createIncrementModulo 生成“每轮更新下标”的代码
     Value numBuffersVal =
-        arith::ConstantIntOp::create(builder, loc, numBuffers, 32);
-    loadGroup.insertIdx = createIncrementModulo(builder, loc, insertIdx,
-                                                numBuffersVal, zero, one);
+        arith::ConstantIntOp::create(builder, loc, numBuffers, 32); //numBuffers是2
+    loadGroup.insertIdx = createIncrementModulo(builder, loc, insertIdx, //insertIdx是-1
+                                                numBuffersVal, zero, one); //第一轮是(-1 + 1) % 2 = 0
     Value cndExt = nullptr;
     loadGroup.extractIdx = createIncrementModulo(
-        builder, loc, extractIdx, numBuffersVal, zero, one, &cndExt);
-    if (phase) {
+        builder, loc, extractIdx, numBuffersVal, zero, one, &cndExt);//第一轮是(-1 + 1) % 2 = 0
+    /*
+
+    scf.for %arg5 = %lb to %ub step %step
+        iter_args(%arg6 = %ptrA, %arg7 = %ptrB, %arg8 = %acc,
+                  %arg9 = %c-1_i32,   // insertIdx  初值
+                  %arg10 = %c-1_i32)  // extractIdx 初值
+        -> (...) {
+
+      // ---- createIncrementModulo(insert) ----
+      %c2_i32 = arith.constant 2 : i32
+      %c0_i32 = arith.constant 0 : i32
+      %c1_i32 = arith.constant 1 : i32
+
+      %0 = arith.addi %arg9, %c1_i32 : i32          // -1+1 / 0+1 / 1+1
+      %1 = arith.cmpi sge, %0, %c2_i32 : i32        // >= 2 ?
+      %insert = arith.select %1, %c0_i32, %0 : i32  // 绕回 0，否则用 +1
+
+      // ---- createIncrementModulo(extract) ----
+      %2 = arith.addi %arg10, %c1_i32 : i32
+      %3 = arith.cmpi sge, %2, %c2_i32 : i32        // 这就是 cndExt
+      %extract = arith.select %3, %c0_i32, %2 : i32
+
+      // 后面：memdesc_index %alloc[%insert] / [%extract]
+      // ...
+      scf.yield %..., %..., %..., %insert, %extract : ...
+    }
+    没有真正的 % 指令，就是 addi + cmpi sge + select。
+    每轮跑一遍，yield 把 %insert/%extract 传回下一轮的 %arg9/%arg10。
+
+    */
+    if (phase) {//GEMM不会进这里
       Value nextPhase = arith::XOrIOp::create(builder, loc, phase, one);
       phase = arith::SelectOp::create(builder, loc, cndExt, nextPhase, phase);
       loadGroup.phase = phase;
@@ -587,8 +730,18 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
 
   createTMABarrierAndWait(forOp, asyncLoads, loadGroups, schedule);
 
+  /*
+  loadGroups[asyncLoad.stageDiff]; 是 LoadGroupInfo
+  struct LoadGroupInfo {
+    Value insertIdx;
+    Value extractIdx;
+    Value phase;//nullptr        // 仅 TMA 时才有
+    bool hasTMALoad;
+  };
+  此时，insertIdx是0，extractIdx是0，phase是nullptr，hasTMALoad是false
+  */
   bool hasAsyncLoads = false;
-  for (auto [op, asyncLoad] : asyncLoads) {
+  for (auto [op, asyncLoad] : asyncLoads) {//两个load
     auto [insertIdx, extractIdx, phase, _] = loadGroups[asyncLoad.stageDiff];
     if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
       createAsyncCopy(forOp, loadOp, asyncLoad.alloc, insertIdx, extractIdx,
