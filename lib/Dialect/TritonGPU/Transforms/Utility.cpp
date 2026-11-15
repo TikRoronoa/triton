@@ -1203,7 +1203,7 @@ getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible) {// val指的是l
         unsigned bitWidth = srcTy.getElementTypeBitWidth();// fp16, 16 bits
         // 得到 后面 local_alloc / async_copy 要用的 SMEM layout
         // 即：#ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>，对应lp3 里的 #shared
-        tempAttr = ttg::SwizzledSharedEncodingAttr::get(
+        tempAttr = ttg::SwizzledSharedEncodingAttr::get(//虽然namespace是ttg，但是他调用的是一个mlir的函数，不是ttg的函数
             val.getContext(), 
             dot, // #ttg.dot_op{opIdx, parent=#mma, kWidth}
             srcTy.getShape(), // [128,32] 或 [32,128]
@@ -1225,7 +1225,7 @@ getSharedEncIfAllUsersAreDotEnc(Value val, bool &incompatible) {// val指的是l
     }
     attr = tempAttr;
   }
-  return attr;
+  return attr;//#ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>
 }
 
 static Type getNewType(Type type, Attribute encoding) {
@@ -1550,7 +1550,7 @@ replaceUsesWithLocalLoad(OpBuilder &builder, OpResult old,
   //  Remove redundant local_load -> local_alloc
   auto allocTy = alloc.getType();
   SmallVector<ttg::LocalAllocOp> allocsToErase;
-  for (Operation *user : old.getUsers()) {
+  for (Operation *user : old.getUsers()) {//GEMM跳过这个for循环
     if (auto userAlloc = dyn_cast<ttg::LocalAllocOp>(user)) {
       if (allocTy.getEncoding() == userAlloc.getType().getEncoding()) {
         replaceUsesAndPropagateType(builder, userAlloc, alloc);
@@ -1562,9 +1562,20 @@ replaceUsesWithLocalLoad(OpBuilder &builder, OpResult old,
   // If there are some uses that were not local_allocs, we need to create a
   // local_load for them.
   ttg::LocalLoadOp maybeLocalLoad;
+  /*
+  GEMM：1 个 user = convert_layout，allocsToErase 空, 1 > 0 → 要建 local_load
+  */
   if (std::distance(old.getUsers().begin(), old.getUsers().end()) >
       allocsToErase.size()) {
+    /*
+    old 是 OpResult（原 tt.load 的那个结果 Value）
+    old.getOwner() : 产出这个 result 的 Operation*，也就是那个 tt.load 本身。
+    */
     auto loc = old.getOwner()->getLoc();
+    /*
+    alloc： viewLoad = memdesc_index(多缓冲alloc, extractIdx)，当前要读的那一槽 SMEM（!ttg.memdesc<128x32xf16, #shared, ...>）
+    token： wait.getResult() = async_wait 的 token，表示对应 async_copy 已完成，可以安全读
+    */
     maybeLocalLoad =
         ttg::LocalLoadOp::create(builder, loc, old.getType(), alloc, token);
     old.replaceAllUsesWith(maybeLocalLoad);

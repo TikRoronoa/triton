@@ -490,8 +490,9 @@ ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(RankedTensorType ty) {
 //  为load 选一个 shared memory 的 layout（encoding），按优先级试四档，选中就返回。不改 IR。
 ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(Operation *op) {
   // Try to use local alloc encoding if possible.
+  // local alloc是从SMEM中加载数据时用的op， local_alloc
   ttg::SharedEncodingTrait localAllocEnc;
-  // 此时load op的使用者不是LocalAllocOp，所以直接跳过if
+  // 此时load op的使用者不是LocalAllocOp，而是convert_layout，所以直接跳过if
   if (llvm::any_of(op->getUsers(), [&](Operation *user) {
         return isa<ttg::LocalAllocOp>(user);
       })) {
@@ -529,6 +530,7 @@ ttg::SharedEncodingTrait mlir::triton::getSharedEncoding(Operation *op) {
 
   // Try to use dot encoding if possible.
   bool incompatible = false;
+  //结果得到：#ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>，即：一个thread最多能连续读 8 个 f16。
   localAllocEnc =
       getSharedEncIfAllUsersAreDotEnc(op->getResult(0), incompatible)
           .value_or(nullptr);

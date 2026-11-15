@@ -180,7 +180,7 @@ void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
   */
   Operation *copy = ttg::AsyncCopyGlobalToLocalOp::create(
       builder, 
-      src, //原 load 的指针
+      src, //原 load 中GMEM的指针
       view, //当前写槽（memdesc_index(alloc, insertIdx)）
       mask, other,//mask，other与原 load 相同 
       loadOp.getCache(), loadOp.getEvict(),//原 load 属性原样带上
@@ -190,7 +190,11 @@ void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
       ttg::AsyncCommitGroupOp::create(builder, copy->getResult(0));
 
   // Create wait and local load
-  //后面插的 op 改用 消费者 的拍（GEMM A：convert 的 stage=2），不再跟 load 的 stage=0
+  /* 
+  后面插的 op 改用 消费者 的拍（GEMM A：convert 的 stage=2），不再跟 load 的 stage=0
+  因为「发出拷贝」和「等着用数据」不在同一拍。
+  若 wait/local_load 也标成 stage 0，会和 copy 挤在同一 stage，藏不住那两拍延迟，流水失去意义
+  */
   builder.setStageCluster(schedule[firstUse]);
   /*
   这两行创建 ttg.async_wait 和 ttg.local_load：
@@ -213,15 +217,14 @@ void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
     函数会新建：
     %ll = ttg.local_load %viewLoad, %waitToken
         : !ttg.memdesc<128x32xf16, ...> -> tensor<128x32xf16, #blocked>
-    其他使用load的结果的op，都会被替换成这个新的local_load
+    其他使用load的结果的op，都会被替换成这个新的local_load：
     // 之前
     %12 = ttg.convert_layout %11 ...
     // 之后
     %12 = ttg.convert_layout %ll ...
-
     */
     replaceUsesWithLocalLoad(builder, 
-                            loadOp->getResult(0), //load的结果（tensor<128x32xf16>）
+                            loadOp->getResult(0), //load的结果（tensor<128x32xf16>）,用来找load结果的user
                             viewLoad, //当前读槽（memdesc_index(alloc, extractIdx)）（tensor<128x32xf16>），本地load的指针
                             wait.getResult()); //wait token
   } else if (loadOp->use_begin() != loadOp->use_end()) {
@@ -508,7 +511,7 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         // 这里是 tensor load（GEMM 即 tt.load）
         // 选出 从GMEM load 到 SMEM 的 shared encoding（#ttg.swizzled_shared）
         // 后面 createAlloc 会用它生成!ttg.memdesc<2x128x32xf16, #shared, #smem, mutable>里面的 #shared 的 encoding
-        sharedEncoding = getSharedEncoding(&op);
+        sharedEncoding = getSharedEncoding(&op);//#ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>
         // Do not create async loads for small loads (cp.async requires at least
         // 4 bytes)
         canUseAsyncCp =
@@ -546,9 +549,9 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
           SharedEncodingTrait sharedEncoding;
         };
         */
-        auto &asyncLoad = asyncLoads[&op];
-        asyncLoad.stageDiff = stageDiff;
-        asyncLoad.contiguity = contiguity;
+        auto &asyncLoad = asyncLoads[&op];// loadA/B 的 asyncLoad
+        asyncLoad.stageDiff = stageDiff;//2
+        asyncLoad.contiguity = contiguity;//4
         asyncLoad.sharedEncoding = sharedEncoding;//#ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 4, order = [1, 0]}>
       } else if (stageDiff > 1) {
         // Distance-1 loads can in most cases be pipelined in registers without
@@ -607,7 +610,7 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   Value one = arith::ConstantIntOp::create(builder, loc, 1, 32);
   SmallVector<Value> newOperands;
   /*
-  拿到forOp的参数个数：1个循环变量和3个变量
+  拿到forOp的参数个数：1个循环变量iv和3个变量
   scf.for %arg5 = %arg0 to %arg1 step %arg2 iter_args(...)
           ^^^^^
      induction var
@@ -654,6 +657,9 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     bool hasTMALoad;
   };
   */
+  /*
+  给每个 load 组装好「写槽 / 读槽」下标，并在 for body 开头插入每轮 +1 % numBuffers 的更新代码。
+  */
   for (auto &[numBuffers, loadGroup] : loadGroups) {//loadGroups有且只有一个item：{2, LoadGroupInfo}
     // 从刚挂上的 iter_args 里把 insert/extract 下标取出来。
     Value insertIdx = forOp.getBody()->getArgument(argIdx);//argIdx是4， insertIdx是-1
@@ -686,6 +692,11 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     // 这两个createIncrementModulo 生成“每轮更新下标”的代码
     Value numBuffersVal =
         arith::ConstantIntOp::create(builder, loc, numBuffers, 32); //numBuffers是2
+    /*
+      %38 = arith.addi %arg10, %c1_i32 : i32
+      %39 = arith.cmpi sge, %38, %c2_i32 : i32
+      %40 = arith.select %39, %c0_i32, %38 : i32
+    */
     loadGroup.insertIdx = createIncrementModulo(builder, loc, insertIdx, //insertIdx是-1
                                                 numBuffersVal, zero, one); //第一轮是(-1 + 1) % 2 = 0
     Value cndExt = nullptr;
@@ -756,10 +767,16 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
                            schedule);
     }
   }
-  // Patch the yield with the updated counters. Subtract to account for the loop
-  // counter.
+  // Patch the yield with the updated counters. Subtract to account for the loop counter.
   argIdx = newOperandIndex - 1;
   for (auto &[numBuffers, loadGroup] : loadGroups) {
+    /*
+    前面 addIterArgsToLoop 后，为合法 IR 曾把初值 -1 先 append 进 scf.yield。
+    body 开头的 createIncrementModulo 已经得到本轮真正的 %insert / %extract（存在 loadGroup.insertIdx/extractIdx）。
+    这两行：
+    下一轮的 %arg9/%arg10 接上本轮更新后的下标，环形缓冲才能转起来。
+    在 LowerLoops 里两者「同步 +1」是故意的；真正错开发生在后面的 pipeline expand（prologue）之后。
+    */
     forYield.setOperand(argIdx++, loadGroup.insertIdx);
     forYield.setOperand(argIdx++, loadGroup.extractIdx);
     if (loadGroup.phase)
